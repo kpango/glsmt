@@ -7,11 +7,11 @@ import (
 )
 
 type Node[V any] struct {
-	parent      *Node[V]
-	children    [256]*Node[V]
-	extChildren *swiss.Map[rune, *Node[V]]
-	value       *V
-	mu          sync.RWMutex
+	// parent *Node[V]
+	prefix   string
+	children *swiss.Map[rune, *Node[V]]
+	value    *V
+	mu       sync.RWMutex
 }
 
 type Trie[V any] interface {
@@ -22,10 +22,10 @@ type Trie[V any] interface {
 
 type trie[V any] struct {
 	root  *Node[V]
-	nSize int
+	nSize uint32
 }
 
-func NewTrie[V any](size int) Trie[V] {
+func NewTrie[V any](size uint32) Trie[V] {
 	return &trie[V]{
 		root:  newNode[V](),
 		nSize: size,
@@ -37,69 +37,53 @@ func newNode[V any]() *Node[V] {
 }
 
 func (n *Node[V]) getChild(ch rune) (node *Node[V], ok bool) {
-	if ch < 256 {
-		n.mu.RLock()
-		node = n.children[ch]
-		n.mu.RUnlock()
-		return node, node != nil
-	}
 	n.mu.RLock()
-	node, ok = n.extChildren.Get(ch)
-	n.mu.RUnlock()
+	defer n.mu.RUnlock()
+	if n.children != nil {
+		node, ok = n.children.Get(ch)
+	}
 	return node, ok && node != nil
 }
 
-func (n *Node[V]) setChild(ch rune, child *Node[V], size int) (node *Node[V], ok bool) {
-	if ch < 256 {
-		n.mu.Lock()
-		node = n.children[ch]
-		if node == nil {
-			n.children[ch] = child
-			node = child
-			ok = true
-		}
-		n.mu.Unlock()
-	} else {
-		n.mu.Lock()
-		if n.extChildren == nil {
-			n.extChildren = swiss.NewMap[rune, *Node[V]](16)
-		}
-		node, ok = n.extChildren.Get(ch)
-		if !ok && node == nil {
-			n.extChildren.Put(ch, child)
-			node = child
-			ok = true
-		}
-		n.mu.Unlock()
+func (n *Node[V]) setChild(ch rune, child *Node[V], size uint32) (node *Node[V], ok bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.children == nil {
+		n.children = swiss.NewMap[rune, *Node[V]](size)
+	}
+	node, ok = n.children.Get(ch)
+	if !ok && node == nil {
+		n.children.Put(ch, child)
+		node = child
+		ok = true
 	}
 	return
 }
 
-func (t *trie[V]) Insert(key string, value *V) bool {
-	return t.traverse(key, func(node *Node[V], idx int) (ok bool) {
-		if idx < len(key)-1 {
-			var next *Node[V]
-			for i, ch := range key[idx:] {
-				next, ok = node.getChild(ch)
-				if !ok || next == nil {
-					next, _ = node.setChild(ch, newNode[V](), t.nSize)
-					for _, c := range key[idx+i+1:] {
-						next, _ = next.setChild(c, newNode[V](), t.nSize)
-					}
-					next.value = value
-					return true
-				}
-				node = next
-			}
+func (n *Node[V]) matchPrefix(key string) (i int) {
+	m := min(len(n.prefix), len(key))
+	for i = 0; i < m; i++ {
+		if n.prefix[i] != key[i] {
+			return i
 		}
-		node.value = value
+	}
+	return i
+}
+
+func (t *trie[V]) Insert(key string, value *V) bool {
+	return t.traverse(key, true, func(node *Node[V]) (ok bool) {
+		if node != nil {
+			node.mu.Lock()
+			node.value = value
+			node.mu.Unlock()
+		}
 		return true
 	})
 }
 
 func (t *trie[V]) Get(key string) (v *V, ok bool) {
-	return v, t.traverse(key, func(node *Node[V], idx int) (ok bool) {
-		if idx == len(key)-1 {
+	return v, t.traverse(key, false, func(node *Node[V]) (ok bool) {
+		if node != nil {
 			node.mu.RLock()
 			v = node.value
 			node.mu.RUnlock()
@@ -110,8 +94,8 @@ func (t *trie[V]) Get(key string) (v *V, ok bool) {
 }
 
 func (t *trie[V]) Delete(key string) (v *V, ok bool) {
-	return v, t.traverse(key, func(node *Node[V], idx int) (ok bool) {
-		if idx == len(key)-1 {
+	return v, t.traverse(key, false, func(node *Node[V]) (ok bool) {
+		if node != nil {
 			node.mu.Lock()
 			v = node.value
 			node.value = nil
@@ -122,19 +106,46 @@ func (t *trie[V]) Delete(key string) (v *V, ok bool) {
 	})
 }
 
-func (t *trie[V]) traverse(key string, fn func(node *Node[V], idx int) bool) (ok bool) {
+func (t *trie[V]) traverse(key string, edit bool, fn func(node *Node[V]) bool) (ok bool) {
 	node := t.root
-	var (
-		i    int
-		ch   rune
-		next *Node[V]
-	)
-	for i, ch = range key {
-		next, ok = node.getChild(ch)
-		if !ok || next == nil {
-			return fn(node, i)
+	for len(key) > 0 && node != nil {
+		node.mu.RLock()
+		if node.prefix == key {
+			node.mu.RUnlock()
+			return fn(node)
 		}
-		node = next
+		pLen := node.matchPrefix(key)
+		if edit && pLen < len(node.prefix) {
+			// split node
+			child := &Node[V]{prefix: node.prefix[pLen:], children: node.children, value: node.value}
+			ch = rune(node.prefix[pLen])
+			node.mu.RUnlock()
+			node.mu.Lock()
+			node.value = nil
+			node.prefix = node.prefix[:pLen]
+			node.children = nil
+			node.mu.Unlock()
+			_, _ = node.setChild(ch, child, t.nSize)
+		} else {
+			node.mu.RUnlock()
+		}
+
+		if pLen < len(key) {
+			next, ok := node.getChild(rune(key[pLen]))
+			if !ok {
+				if !edit {
+					return fn(node)
+				}
+				next, ok = node.setChild(ch, &Node[V]{prefix: key[pLen:]}, t.nSize)
+				if !ok || next == nil {
+					return fn(node)
+				}
+			}
+			node = next
+			key = key[pLen:]
+		} else if !edit {
+			return fn(node)
+		}
 	}
-	return fn(node, i)
+	return fn(node)
 }

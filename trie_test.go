@@ -1,9 +1,11 @@
 package glsmt
 
-import "testing"
+import (
+	"testing"
+)
 
 func TestTrie(t *testing.T) {
-	tr := NewTrie[string](10)
+	tr := NewTrie[string](0)
 
 	keys := []string{"apple", "app", "bat", "ball"}
 	for _, key := range keys {
@@ -11,10 +13,15 @@ func TestTrie(t *testing.T) {
 		tr.Insert(key, &k)
 	}
 
+	// tr.Range(func(key string, value *string) bool {
+	// t.Logf("key: %s, value: %s", key, *value)
+	// return true
+	// })
+
 	for _, key := range keys {
 		val, ok := tr.Get(key)
 		if !ok || *val != key {
-			t.Errorf("Get failed for key %s, got %v", key, *val)
+			t.Errorf("Get failed for key %s, got %v", key, val)
 		}
 	}
 
