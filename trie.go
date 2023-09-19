@@ -7,7 +7,6 @@ import (
 )
 
 type Node[V any] struct {
-	// parent *Node[V]
 	prefix   string
 	children *swiss.Map[rune, *Node[V]]
 	value    *V
@@ -37,8 +36,6 @@ func newNode[V any]() *Node[V] {
 }
 
 func (n *Node[V]) getChild(ch rune) (node *Node[V], ok bool) {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
 	if n.children != nil {
 		node, ok = n.children.Get(ch)
 	}
@@ -46,8 +43,6 @@ func (n *Node[V]) getChild(ch rune) (node *Node[V], ok bool) {
 }
 
 func (n *Node[V]) setChild(ch rune, child *Node[V], size uint32) (node *Node[V], ok bool) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
 	if n.children == nil {
 		n.children = swiss.NewMap[rune, *Node[V]](size)
 	}
@@ -107,7 +102,11 @@ func (t *trie[V]) Delete(key string) (v *V, ok bool) {
 }
 
 func (t *trie[V]) traverse(key string, edit bool, fn func(node *Node[V]) bool) (ok bool) {
-	node := t.root
+	var (
+		node = t.root
+		ch   rune
+		next *Node[V]
+	)
 	for len(key) > 0 && node != nil {
 		node.mu.RLock()
 		if node.prefix == key {
@@ -115,28 +114,37 @@ func (t *trie[V]) traverse(key string, edit bool, fn func(node *Node[V]) bool) (
 			return fn(node)
 		}
 		pLen := node.matchPrefix(key)
-		if edit && pLen < len(node.prefix) {
-			// split node
-			child := &Node[V]{prefix: node.prefix[pLen:], children: node.children, value: node.value}
-			ch = rune(node.prefix[pLen])
-			node.mu.RUnlock()
+		node.mu.RUnlock()
+		if edit {
 			node.mu.Lock()
-			node.value = nil
-			node.prefix = node.prefix[:pLen]
-			node.children = nil
+			if pLen < len(node.prefix) {
+				ch = rune(node.prefix[pLen])
+				next = &Node[V]{prefix: node.prefix[pLen:], children: node.children, value: node.value}
+				node.value = nil
+				node.prefix = node.prefix[:pLen]
+				node.children = nil
+				_, _ = node.setChild(ch, next, t.nSize)
+			} else if len(node.prefix) == 0 && node.children == nil && node.value == nil && pLen < len(key) {
+				node.prefix = key[pLen:]
+				node.mu.Unlock()
+				return fn(node)
+			}
 			node.mu.Unlock()
-			_, _ = node.setChild(ch, child, t.nSize)
-		} else {
-			node.mu.RUnlock()
 		}
 
 		if pLen < len(key) {
-			next, ok := node.getChild(rune(key[pLen]))
-			if !ok {
+			ch = rune(key[pLen])
+			node.mu.RLock()
+			next, ok = node.getChild(ch)
+			node.mu.RUnlock()
+			if !ok || next == nil {
 				if !edit {
 					return fn(node)
 				}
-				next, ok = node.setChild(ch, &Node[V]{prefix: key[pLen:]}, t.nSize)
+				next = &Node[V]{prefix: key[pLen:]}
+				node.mu.Lock()
+				next, ok = node.setChild(ch, next, t.nSize)
+				node.mu.Unlock()
 				if !ok || next == nil {
 					return fn(node)
 				}
